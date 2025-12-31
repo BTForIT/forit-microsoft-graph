@@ -95,12 +95,11 @@ export function registerAuthTools(server: McpServer, authManager: AuthManager, g
   server.tool('list-accounts', 'List all available Microsoft accounts', {}, async () => {
     try {
       const accounts = await authManager.listAccounts();
-      const selectedAccountId = authManager.getSelectedAccountId();
+      // No 'selected' field - accountId is always required when multiple accounts exist
       const result = accounts.map((account) => ({
         id: account.homeAccountId,
         username: account.username,
         name: account.name,
-        selected: account.homeAccountId === selectedAccountId,
       }));
 
       return {

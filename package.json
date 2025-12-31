@@ -70,10 +70,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/BTForIT/forit-microsoft-graph.git"
+    "url": "https://github.com/ForITLLC/forit-microsoft-graph.git"
   },
-  "homepage": "https://github.com/BTForIT/forit-microsoft-graph#readme",
+  "homepage": "https://github.com/ForITLLC/forit-microsoft-graph#readme",
   "bugs": {
-    "url": "https://github.com/BTForIT/forit-microsoft-graph/issues"
+    "url": "https://github.com/ForITLLC/forit-microsoft-graph/issues"
   }
 }

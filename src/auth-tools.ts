@@ -231,6 +231,25 @@ Documentation:
       },
       async ({ endpoint, method, body, queryParams, headers, apiVersion, accountId }) => {
         try {
+          // REQUIRE accountId when multiple accounts exist
+          const accounts = await authManager.listAccounts();
+          if (accounts.length > 1 && !accountId) {
+            const available = accounts.map(a => `"${a.username}" (${a.homeAccountId.substring(0, 8)}...)`).join(', ');
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    error: `Multiple accounts exist. You MUST specify accountId.`,
+                    available: accounts.map(a => ({ username: a.username, id: a.homeAccountId })),
+                    hint: `Available: ${available}`,
+                  }),
+                },
+              ],
+              isError: true,
+            };
+          }
+
           // Get token for specific account if requested
           let accessToken: string | undefined;
           if (accountId) {

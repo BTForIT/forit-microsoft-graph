@@ -337,11 +337,27 @@ class AuthManager {
     const deviceCodeRequest = {
       scopes: this.scopes,
       deviceCodeCallback: (response: { message: string }) => {
-        const text = ['\n', response.message, '\n'].join('');
+        // Extract device code from message
+        const codeMatch = response.message.match(/code\s+([A-Z0-9]+)\s+to authenticate/i);
+        const deviceCode = codeMatch ? codeMatch[1] : 'CHECK MESSAGE BELOW';
+
+        const clearText = `
+████████████████████████████████████████████████████████████
+██                                                        ██
+██   DEVICE CODE: ${deviceCode.padEnd(12)}                       ██
+██                                                        ██
+██   Go to: https://microsoft.com/devicelogin            ██
+██                                                        ██
+████████████████████████████████████████████████████████████
+
+${response.message}
+
+After login run the "verify login" command
+`;
         if (hack) {
-          hack(text + 'After login run the "verify login" command');
+          hack(clearText);
         } else {
-          console.log(text);
+          console.log(clearText);
         }
         logger.info('Device code login initiated');
       },

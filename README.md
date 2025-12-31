@@ -88,10 +88,20 @@ npm install -g @foritllc/microsoft-graph
 }
 ```
 
+### Authentication (Device Code)
+
+**Device code authentication is used**, which is the most reliable method for:
+- SSH sessions where browser auth isn't available
+- Headless servers
+- Remote development environments
+- AI agent automation
+
+The device code is displayed prominently in a box format for visibility.
+
 ### Login to Multiple Tenants
 
 ```bash
-# First tenant
+# First tenant (device code displayed clearly)
 npx @foritllc/microsoft-graph --login
 
 # Second tenant (adds to cache)
@@ -100,6 +110,19 @@ npx @foritllc/microsoft-graph --login
 # See all accounts
 npx @foritllc/microsoft-graph --list-accounts
 ```
+
+### Multi-Account Requirement
+
+When multiple accounts exist, you **must** specify which account to use:
+
+```json
+{
+  "endpoint": "/me",
+  "accountId": "abc123..."
+}
+```
+
+Without `accountId`, requests will error showing available accounts. Use `list-accounts` tool to see account IDs.
 
 ---
 

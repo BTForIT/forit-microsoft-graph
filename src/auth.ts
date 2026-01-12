@@ -47,9 +47,17 @@ const endpoints = {
 const SERVICE_NAME = 'ms-365-mcp-server';
 const TOKEN_CACHE_ACCOUNT = 'msal-token-cache';
 const SELECTED_ACCOUNT_KEY = 'selected-account';
+const ACCOUNT_METADATA_KEY = 'account-metadata';
 const FALLBACK_DIR = path.dirname(fileURLToPath(import.meta.url));
 const FALLBACK_PATH = path.join(FALLBACK_DIR, '..', '.token-cache.json');
 const SELECTED_ACCOUNT_PATH = path.join(FALLBACK_DIR, '..', '.selected-account.json');
+const ACCOUNT_METADATA_PATH = path.join(FALLBACK_DIR, '..', '.account-metadata.json');
+
+// Maps accountId -> { appId, tenantId } for multi-tenant support
+interface AccountMetadata {
+  appId: string;
+  tenantId: string;
+}
 
 const DEFAULT_CONFIG: Configuration = {
   auth: {
@@ -144,6 +152,7 @@ class AuthManager {
   private oauthToken: string | null;
   private isOAuthMode: boolean;
   private selectedAccountId: string | null;
+  private accountMetadata: Map<string, AccountMetadata> = new Map();
 
   constructor(
     config: Configuration = DEFAULT_CONFIG,
@@ -190,8 +199,61 @@ class AuthManager {
 
       // Load selected account
       await this.loadSelectedAccount();
+      // Load account metadata (appId/tenantId per account)
+      await this.loadAccountMetadata();
     } catch (error) {
       logger.error(`Error loading token cache: ${(error as Error).message}`);
+    }
+  }
+
+  private async loadAccountMetadata(): Promise<void> {
+    try {
+      let metadataStr: string | undefined;
+
+      try {
+        const kt = await getKeytar();
+        if (kt) {
+          const cachedData = await kt.getPassword(SERVICE_NAME, ACCOUNT_METADATA_KEY);
+          if (cachedData) {
+            metadataStr = cachedData;
+          }
+        }
+      } catch (keytarError) {
+        logger.warn(`Keychain access failed for account metadata: ${(keytarError as Error).message}`);
+      }
+
+      if (!metadataStr && existsSync(ACCOUNT_METADATA_PATH)) {
+        metadataStr = readFileSync(ACCOUNT_METADATA_PATH, 'utf8');
+      }
+
+      if (metadataStr) {
+        const parsed = JSON.parse(metadataStr) as Record<string, AccountMetadata>;
+        this.accountMetadata = new Map(Object.entries(parsed));
+        logger.info(`Loaded metadata for ${this.accountMetadata.size} accounts`);
+      }
+    } catch (error) {
+      logger.error(`Error loading account metadata: ${(error as Error).message}`);
+    }
+  }
+
+  private async saveAccountMetadata(): Promise<void> {
+    try {
+      const metadataObj = Object.fromEntries(this.accountMetadata);
+      const metadataStr = JSON.stringify(metadataObj);
+
+      try {
+        const kt = await getKeytar();
+        if (kt) {
+          await kt.setPassword(SERVICE_NAME, ACCOUNT_METADATA_KEY, metadataStr);
+        } else {
+          fs.writeFileSync(ACCOUNT_METADATA_PATH, metadataStr, { mode: 0o600 });
+        }
+      } catch (keytarError) {
+        logger.warn(`Keychain save failed for account metadata: ${(keytarError as Error).message}`);
+        fs.writeFileSync(ACCOUNT_METADATA_PATH, metadataStr, { mode: 0o600 });
+      }
+    } catch (error) {
+      logger.error(`Error saving account metadata: ${(error as Error).message}`);
     }
   }
 
@@ -290,13 +352,32 @@ class AuthManager {
     const currentAccount = await this.getCurrentAccount();
 
     if (currentAccount) {
+      // Get the appId/tenantId that was used to authenticate this account
+      const metadata = this.accountMetadata.get(currentAccount.homeAccountId);
+      let msalApp = this.msalApp;
+
+      if (metadata) {
+        // Create MSAL app with the correct appId/tenantId for this account
+        const customConfig: Configuration = {
+          auth: {
+            clientId: metadata.appId,
+            authority: `https://login.microsoftonline.com/${metadata.tenantId}`,
+          },
+        };
+        msalApp = new PublicClientApplication(customConfig);
+        // Load the token cache
+        const cacheData = this.msalApp.getTokenCache().serialize();
+        msalApp.getTokenCache().deserialize(cacheData);
+        logger.info(`Using custom app for token refresh: appId=${metadata.appId}, tenant=${metadata.tenantId}`);
+      }
+
       const silentRequest = {
         account: currentAccount,
         scopes: this.scopes,
       };
 
       try {
-        const response = await this.msalApp.acquireTokenSilent(silentRequest);
+        const response = await msalApp.acquireTokenSilent(silentRequest);
         this.accessToken = response.accessToken;
         this.tokenExpiry = response.expiresOn ? new Date(response.expiresOn).getTime() : null;
         return this.accessToken;
@@ -399,6 +480,16 @@ After login run the "verify login" command
       if (options?.appId || options?.tenantId) {
         const newCacheData = msalApp.getTokenCache().serialize();
         this.msalApp.getTokenCache().deserialize(newCacheData);
+      }
+
+      // Save account metadata (appId/tenantId) for this account
+      if (response?.account) {
+        const accountId = response.account.homeAccountId;
+        const appIdUsed = options?.appId || this.config.auth.clientId;
+        const tenantIdUsed = options?.tenantId || 'common';
+        this.accountMetadata.set(accountId, { appId: appIdUsed, tenantId: tenantIdUsed });
+        await this.saveAccountMetadata();
+        logger.info(`Saved metadata for account ${response.account.username}: appId=${appIdUsed}, tenant=${tenantIdUsed}`);
       }
 
       // Set the newly authenticated account as selected if no account is currently selected
@@ -567,7 +658,7 @@ After login run the "verify login" command
 
   /**
    * Get a token for a specific account without switching the selected account.
-   * Useful for multi-tenant operations where you need to query different accounts.
+   * Uses the correct appId/tenantId that was used when the account was authenticated.
    */
   async getTokenForAccount(accountId: string): Promise<string | null> {
     const accounts = await this.listAccounts();
@@ -578,18 +669,44 @@ After login run the "verify login" command
       return null;
     }
 
+    // Get the appId/tenantId that was used to authenticate this account
+    const metadata = this.accountMetadata.get(accountId);
+    let msalApp = this.msalApp;
+
+    if (metadata) {
+      // Create MSAL app with the correct appId/tenantId for this account
+      const customConfig: Configuration = {
+        auth: {
+          clientId: metadata.appId,
+          authority: `https://login.microsoftonline.com/${metadata.tenantId}`,
+        },
+      };
+      msalApp = new PublicClientApplication(customConfig);
+      // Load the token cache
+      const cacheData = this.msalApp.getTokenCache().serialize();
+      msalApp.getTokenCache().deserialize(cacheData);
+      logger.info(`Using custom app for account ${account.username}: appId=${metadata.appId}, tenant=${metadata.tenantId}`);
+    }
+
     const silentRequest = {
       account: account,
       scopes: this.scopes,
     };
 
     try {
-      const response = await this.msalApp.acquireTokenSilent(silentRequest);
+      const response = await msalApp.acquireTokenSilent(silentRequest);
       return response.accessToken;
     } catch (error) {
       logger.error(`Failed to get token for account ${accountId}: ${(error as Error).message}`);
       return null;
     }
+  }
+
+  /**
+   * Get account metadata (appId, tenantId) for a specific account
+   */
+  getAccountMetadata(accountId: string): AccountMetadata | undefined {
+    return this.accountMetadata.get(accountId);
   }
 }
 

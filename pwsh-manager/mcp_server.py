@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -20,9 +21,52 @@ import requests
 # Add parent dir to path for shared logger
 sys.path.insert(0, str(Path(__file__).parent.parent))
 try:
-    from mcp_logger import log_tool_call
+    from mcp_logger import log_tool_call, log_session_event, get_session_history
 except ImportError:
-    def log_tool_call(*args, **kwargs): pass  # Fallback if logger not available
+    def log_tool_call(*args, **kwargs): pass
+    def log_session_event(*args, **kwargs): pass
+    def get_session_history(*args, **kwargs): return []
+
+# Session ID for tracking - set during initialize or from environment
+# This is mutable - can be updated when MCP client sends session info
+_session_id: Optional[str] = None
+
+
+def get_session_id() -> str:
+    """Get current session ID, generating fallback if needed."""
+    global _session_id
+    if _session_id:
+        return _session_id
+
+    # Check environment (generic, then Claude-specific for compatibility)
+    for env_var in ["MCP_SESSION_ID", "CLAUDE_SESSION_ID", "PWSH_get_session_id()"]:
+        val = os.getenv(env_var, "")
+        if val:
+            _session_id = val[:8]
+            return _session_id
+
+    # Check session file (written by client hooks)
+    for session_file in ["~/.mcp-session", "~/.claude-current-session"]:
+        try:
+            path = Path(session_file).expanduser()
+            if path.exists():
+                val = path.read_text().strip()
+                if val:
+                    _session_id = val[:8]
+                    return _session_id
+        except Exception:
+            pass
+
+    # Generate random fallback
+    _session_id = str(uuid.uuid4())[:8]
+    return _session_id
+
+
+def set_session_id(session_id: str):
+    """Set session ID (called from initialize or tool params)."""
+    global _session_id
+    if session_id:
+        _session_id = session_id[:8]
 
 # Configuration
 PWSH_MANAGER_URL = os.getenv("PWSH_MANAGER_URL", "http://localhost:5100")
@@ -69,11 +113,14 @@ def get_sharepoint_tenant(tenant_domain: str) -> str:
     return SHAREPOINT_TENANTS.get(tenant_domain, tenant_domain.split(".")[0])
 
 
-def api_call(endpoint: str, data: dict = None) -> dict:
+def api_call(endpoint: str, data: dict = None, include_conversation: bool = True) -> dict:
     """Make API call to session manager."""
     url = f"{PWSH_MANAGER_URL}{endpoint}"
     try:
         if data:
+            # Include conversation_id for session tracking
+            if include_conversation:
+                data = {**data, "conversation_id": get_session_id()}
             response = requests.post(url, json=data, timeout=REQUEST_TIMEOUT)
         else:
             response = requests.get(url, timeout=REQUEST_TIMEOUT)
@@ -87,12 +134,24 @@ def api_call(endpoint: str, data: dict = None) -> dict:
 # MCP Protocol Implementation
 def handle_initialize(params: dict) -> dict:
     """Handle MCP initialize request."""
+    # Extract session ID from client info if provided (works with any MCP client)
+    client_info = params.get("clientInfo", {})
+    session_id = (
+        params.get("sessionId")  # Direct param
+        or client_info.get("sessionId")  # In clientInfo
+        or client_info.get("session_id")  # Snake case variant
+        or params.get("session_id")
+    )
+    if session_id:
+        set_session_id(session_id)
+
     return {
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {}},
         "serverInfo": {
             "name": "pwsh-manager",
             "version": "1.0.0",
+            "sessionId": get_session_id(),  # Echo back so client knows what we're using
         },
     }
 
@@ -207,6 +266,34 @@ def handle_list_tools() -> dict:
                     "required": ["connectionName", "confirmation"],
                 },
             },
+            {
+                "name": "pwsh_session_history",
+                "description": "View session history/logs to analyze patterns, durations, and identify issues.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tenant": {
+                            "type": "string",
+                            "description": "Filter by tenant domain (optional)",
+                        },
+                        "module": {
+                            "type": "string",
+                            "enum": ["exo", "pnp", "azure", "powerplatform", "teams"],
+                            "description": "Filter by module (optional)",
+                        },
+                        "event": {
+                            "type": "string",
+                            "enum": ["auth_pending", "authenticated", "auth_failed", "session_disconnected", "session_killed"],
+                            "description": "Filter by event type (optional)",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max entries to return (default: 50)",
+                            "default": 50,
+                        },
+                    },
+                },
+            },
         ]
     }
 
@@ -238,6 +325,7 @@ def handle_call_tool(name: str, arguments: dict) -> dict:
             tool_name=name,
             arguments=arguments,
             connection_name=conn_name or None,
+            conversation_id=get_session_id(),
             result=result_summary,
             error=error_msg,
             duration_ms=duration_ms
@@ -267,16 +355,20 @@ def _handle_call_tool_impl(name: str, arguments: dict) -> dict:
         return {"content": [{"type": "text", "text": json.dumps(results, indent=2)}]}
 
     if name == "pwsh_sessions":
-        result = api_call("/sessions")
+        result = api_call("/sessions", include_conversation=False)
 
         if not result.get("sessions"):
             return {"content": [{"type": "text", "text": "No active sessions"}]}
 
-        lines = ["Sessions:", "-" * 50]
+        lines = ["Sessions:", "-" * 60]
         for s in result["sessions"]:
             status = "✓" if s["connected"] else ("⏳" if s["auth_pending"] else "✗")
-            lines.append(f"{status} {s['tenant']} ({s['module']}) - Last used: {s['last_used']}")
+            conv = s.get("conversation_id", "?")[:8] if s.get("conversation_id") else "?"
+            stuck_info = f" [STUCK: {s['stuck_reason']}]" if s.get("stuck") else ""
+            lines.append(f"{status} {s['tenant']} ({s['module']}) - conv: {conv} - Last: {s['last_used'][:19]}{stuck_info}")
 
+        lines.append("-" * 60)
+        lines.append(f"Current conversation: {get_session_id()}")
         return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
     # All other tools require connectionName
@@ -314,10 +406,19 @@ def _handle_call_tool_impl(name: str, arguments: dict) -> dict:
         account = arguments.get("account", "1")
         result = api_call("/login", build_request({"account": account}))
 
+        # Log session lifecycle
+        if result.get("auth_pending"):
+            log_session_event("auth_pending", tenant, module, get_session_id(), {"device_code": result.get("device_code")})
+        elif result.get("success"):
+            log_session_event("authenticated", tenant, module, get_session_id())
+        else:
+            log_session_event("auth_failed", tenant, module, get_session_id(), {"error": result.get("error", "Unknown")})
+
         # Format device code prominently if present
         if result.get("device_code"):
             text = f"**DEVICE CODE: {result['device_code']}**\nGo to: {result.get('auth_url', 'https://microsoft.com/devicelogin')}\n\n"
-            text += f"Connection: {conn_name}\nTenant: {tenant}\nModule: {module}\n\n"
+            text += f"Connection: {conn_name}\nTenant: {tenant}\nModule: {module}\n"
+            text += f"Conversation: {get_session_id()}\n\n"
             if result.get("auth_pending"):
                 text += "Authentication pending. Complete device code flow, then check status."
             else:
@@ -331,10 +432,19 @@ def _handle_call_tool_impl(name: str, arguments: dict) -> dict:
     elif name == "pwsh_status":
         result = api_call("/status", build_request())
 
+        # Log state transitions
+        if result.get("connected") and result.get("was_pending"):
+            # Auth just completed
+            log_session_event("authenticated", tenant, module, get_session_id(), {
+                "auth_duration_seconds": result.get("auth_duration_seconds")
+            })
+
         if result.get("connected"):
             status = f"✓ {conn_name} ({tenant}) - {module}: Connected"
+            status += f"\nConversation: {get_session_id()}"
         elif result.get("auth_pending"):
             status = f"⏳ {conn_name} ({tenant}) - {module}: Authentication pending (complete device code flow)"
+            status += f"\nConversation: {get_session_id()}"
         else:
             status = f"✗ {conn_name} ({tenant}) - {module}: Not connected"
 
@@ -363,8 +473,41 @@ def _handle_call_tool_impl(name: str, arguments: dict) -> dict:
         result = api_call("/disconnect", build_request())
 
         if result.get("success"):
+            log_session_event("session_disconnected", tenant, module, get_session_id())
             return {"content": [{"type": "text", "text": f"Disconnected {conn_name} ({tenant}) - {module}"}]}
         return {"content": [{"type": "text", "text": f"Error: {result.get('error', 'Disconnect failed')}"}], "isError": True}
+
+    elif name == "pwsh_session_history":
+        history = get_session_history(
+            tenant=arguments.get("tenant"),
+            module=arguments.get("module"),
+            event=arguments.get("event"),
+            limit=arguments.get("limit", 50)
+        )
+
+        if not history:
+            return {"content": [{"type": "text", "text": "No session history found"}]}
+
+        # Format as a readable summary
+        lines = [f"Session History ({len(history)} entries):", "-" * 60]
+        for entry in history[-20:]:  # Show last 20
+            ts = entry.get("logged_at", "")[:19]  # Trim to second precision
+            event = entry.get("event", "unknown")
+            tenant_str = entry.get("tenant", "?")
+            module_str = entry.get("module", "?")
+            conv = entry.get("conversation_id", "?")[:8]
+            details = entry.get("details", {})
+
+            line = f"[{ts}] {event:20} {tenant_str}:{module_str} (conv: {conv})"
+            if details:
+                detail_str = ", ".join(f"{k}={v}" for k, v in details.items() if v)
+                if detail_str:
+                    line += f" - {detail_str}"
+            lines.append(line)
+
+        lines.append("-" * 60)
+        lines.append(f"Current conversation: {get_session_id()}")
+        return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
     return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
 

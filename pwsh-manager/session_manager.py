@@ -99,10 +99,12 @@ class Session:
     tenant: str
     module: str
     sharepoint_tenant: Optional[str] = None  # SharePoint tenant prefix (e.g., "foritllc" for foritllc.sharepoint.com)
+    conversation_id: Optional[str] = None  # MCP conversation that created this session
     process: Optional[subprocess.Popen] = None
     authenticated: bool = False
     auth_pending: bool = False
     auth_pending_since: Optional[datetime] = None  # When auth_pending started
+    auth_completed_at: Optional[datetime] = None  # When auth completed
     created_at: datetime = field(default_factory=datetime.now)
     last_used: datetime = field(default_factory=datetime.now)
     last_health_check: Optional[datetime] = None  # Last successful health check
@@ -111,6 +113,7 @@ class Session:
     _reader_thread: Optional[threading.Thread] = None
     _connect_marker_seen: bool = False  # Flag set by reader thread when MARKER detected during auth_pending
     _azure_account_choice: str = "1"  # Which account to select when Azure prompts (default: first)
+    _was_pending: bool = False  # Track if auth just completed from pending state
 
     def start(self) -> bool:
         """Start pwsh or bash process and load module."""
@@ -357,11 +360,16 @@ class Session:
         connected = bool(re.search(config["check_pattern"], result))
 
         if connected:
+            # Track if transitioning from pending to authenticated
+            was_pending = self.auth_pending and self.auth_pending_since is not None
+            self._was_pending = was_pending
+            if was_pending:
+                self.auth_completed_at = datetime.now()
             self.authenticated = True
             self.auth_pending = False
             self._connect_marker_seen = False
             total_ms = int((time.time() - check_start) * 1000)
-            logger.info(f"[{self.tenant}:{self.module}] TIMING: Auth verified, total check took {total_ms}ms")
+            logger.info(f"[{self.tenant}:{self.module}] TIMING: Auth verified, total check took {total_ms}ms (was_pending={was_pending})")
             self.auth_pending_since = None
             self.last_health_check = datetime.now()
         elif self.auth_pending:
@@ -514,15 +522,23 @@ class SessionManager:
     def _key(self, tenant: str, module: str) -> str:
         return f"{tenant}:{module}"
 
-    def get_session(self, tenant: str, module: str, sharepoint_tenant: str = None) -> Session:
+    def get_session(self, tenant: str, module: str, sharepoint_tenant: str = None, conversation_id: str = None) -> Session:
         """Get or create a session."""
         key = self._key(tenant, module)
         with self._lock:
             if key not in self.sessions:
-                self.sessions[key] = Session(tenant=tenant, module=module, sharepoint_tenant=sharepoint_tenant)
-            elif sharepoint_tenant and not self.sessions[key].sharepoint_tenant:
-                # Update existing session with SharePoint tenant if not set
-                self.sessions[key].sharepoint_tenant = sharepoint_tenant
+                self.sessions[key] = Session(
+                    tenant=tenant,
+                    module=module,
+                    sharepoint_tenant=sharepoint_tenant,
+                    conversation_id=conversation_id
+                )
+            else:
+                # Update existing session with optional params if not set
+                if sharepoint_tenant and not self.sessions[key].sharepoint_tenant:
+                    self.sessions[key].sharepoint_tenant = sharepoint_tenant
+                if conversation_id and not self.sessions[key].conversation_id:
+                    self.sessions[key].conversation_id = conversation_id
             return self.sessions[key]
 
     def list_sessions(self) -> list[dict]:
@@ -533,9 +549,11 @@ class SessionManager:
             result.append({
                 "tenant": session.tenant,
                 "module": session.module,
+                "conversation_id": session.conversation_id,
                 "authenticated": session.authenticated,
                 "auth_pending": session.auth_pending,
                 "auth_pending_since": session.auth_pending_since.isoformat() if session.auth_pending_since else None,
+                "auth_completed_at": session.auth_completed_at.isoformat() if session.auth_completed_at else None,
                 "connected": session.check() if session.authenticated else False,
                 "created_at": session.created_at.isoformat(),
                 "last_used": session.last_used.isoformat(),
@@ -588,13 +606,14 @@ def login():
     module = data.get("module", "exo")
     sharepoint_tenant = data.get("sharepoint_tenant")  # Optional: SharePoint tenant prefix
     account = data.get("account", "1")  # Which account to select for Azure (default: 1)
+    conversation_id = data.get("conversation_id")  # MCP conversation tracking
 
     if not tenant:
         return jsonify({"success": False, "error": "tenant is required"}), 400
     if module not in MODULES:
         return jsonify({"success": False, "error": f"Unknown module: {module}"}), 400
 
-    session = manager.get_session(tenant, module, sharepoint_tenant)
+    session = manager.get_session(tenant, module, sharepoint_tenant, conversation_id)
     # Set Azure account choice before connecting
     if module == "azure":
         session._azure_account_choice = str(account)
@@ -622,21 +641,36 @@ def status():
     data = request.get_json() or {}
     tenant = data.get("tenant")
     module = data.get("module", "exo")
+    conversation_id = data.get("conversation_id")  # MCP conversation tracking
 
     if not tenant:
         return jsonify({"success": False, "error": "tenant is required"}), 400
 
-    session = manager.get_session(tenant, module)
+    session = manager.get_session(tenant, module, conversation_id=conversation_id)
     # Always call check() - it handles auth_pending detection and connection verification
     connected = session.check()
 
-    return jsonify({
+    # Calculate auth duration if auth just completed
+    auth_duration_seconds = None
+    if session._was_pending and session.auth_completed_at and session.created_at:
+        auth_duration_seconds = (session.auth_completed_at - session.created_at).total_seconds()
+
+    response = {
         "success": True,
         "tenant": tenant,
         "module": module,
         "connected": connected,
         "auth_pending": session.auth_pending,
-    })
+        "was_pending": session._was_pending,  # Auth just completed from pending state
+        "conversation_id": session.conversation_id,
+    }
+    if auth_duration_seconds is not None:
+        response["auth_duration_seconds"] = auth_duration_seconds
+
+    # Reset was_pending flag after reporting
+    session._was_pending = False
+
+    return jsonify(response)
 
 
 @app.route("/run", methods=["POST"])

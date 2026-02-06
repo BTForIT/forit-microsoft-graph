@@ -3,10 +3,10 @@
 mm MCP - Unified Microsoft 365 management.
 
 Wraps the M365 Session Pool API for MSP multi-tenant operations.
-Also manages the shared connection registry (~/.m365-connections.json).
+Connection registry (~/.m365-connections.json) is READ-ONLY.
+Connections must be pre-created by the user - MCPs cannot modify the registry.
 """
 
-import fcntl
 import json
 import os
 import re
@@ -28,34 +28,17 @@ except ImportError:
 # Session pool endpoint
 SESSION_POOL_URL = os.getenv("MM_SESSION_POOL_URL", "http://localhost:5200")
 
-# Connection registry
+# Connection registry (READ-ONLY)
 CONNECTIONS_FILE = Path.home() / ".m365-connections.json"
-VALID_MCPS = ["pnp-m365", "microsoft-graph", "mm", "exo", "onenote"]
 
 
 def load_registry() -> dict:
+    """Load connection registry. Read-only - never writes."""
     try:
         return json.loads(CONNECTIONS_FILE.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return {"connections": {}}
 
-
-def save_registry(data: dict) -> bool:
-    try:
-        with open(CONNECTIONS_FILE, 'w') as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                json.dump(data, f, indent=2)
-                f.write('\n')
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        return True
-    except Exception:
-        return False
-
-
-def is_valid_guid(s: str) -> bool:
-    return bool(re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', s))
 
 server = Server("mm")
 
@@ -100,47 +83,6 @@ async def list_tools():
                 },
             },
         ),
-        Tool(
-            name="connection_add",
-            description="Add a new M365 connection. Requires appId from an Azure AD app registration.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Connection name (e.g., 'ClientX')"},
-                    "tenant": {"type": "string", "description": "Tenant domain (e.g., 'clientx.onmicrosoft.com')"},
-                    "appId": {"type": "string", "description": "Azure AD app registration ID (GUID)"},
-                    "description": {"type": "string", "description": "What this connection is for"},
-                    "mcps": {"type": "array", "items": {"type": "string"}, "description": f"Which MCPs can use this. Valid: {VALID_MCPS}"},
-                },
-                "required": ["name", "tenant", "appId", "description", "mcps"],
-            },
-        ),
-        Tool(
-            name="connection_remove",
-            description="Remove a connection by name.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Connection name to remove"},
-                },
-                "required": ["name"],
-            },
-        ),
-        Tool(
-            name="connection_update",
-            description="Update an existing connection's properties.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Connection name to update"},
-                    "appId": {"type": "string", "description": "New app ID"},
-                    "tenant": {"type": "string", "description": "New tenant"},
-                    "description": {"type": "string", "description": "New description"},
-                    "mcps": {"type": "array", "items": {"type": "string"}, "description": "New MCP list"},
-                },
-                "required": ["name"],
-            },
-        ),
     ]
 
 
@@ -149,7 +91,7 @@ async def call_tool(name: str, arguments: dict):
     start_time = time.time()
     error_msg = None
     result_summary = None
-    connection_name = arguments.get("connection") or arguments.get("name")
+    connection_name = arguments.get("connection")
 
     try:
         result = _call_tool_impl(name, arguments)
@@ -177,13 +119,6 @@ async def call_tool(name: str, arguments: dict):
 
 
 def _call_tool_impl(name: str, arguments: dict):
-    # Registry tools
-    if name == "connection_add":
-        return _connection_add(arguments)
-    if name == "connection_remove":
-        return _connection_remove(arguments)
-    if name == "connection_update":
-        return _connection_update(arguments)
     if name != "run":
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -191,21 +126,17 @@ def _call_tool_impl(name: str, arguments: dict):
     module = arguments.get("module")
     command = arguments.get("command")
 
-    # No params = list connections
+    # No params = list connections from registry (read-only)
     if not connection and not module and not command:
-        result = call_pool("/connections")
-        connections = result.get("connections", {})
-        metrics = call_pool("/metrics")
+        registry = load_registry()
+        connections = registry.get("connections", {})
 
         output = "**Available Connections:**\n"
         for conn_name, config in connections.items():
-            output += f"- {conn_name}: {config.get('tenant', 'unknown')} ({config.get('description', '')})\n"
-
-        output += f"\n**Session Pool Status:**\n"
-        output += f"- Uptime: {metrics.get('uptime_human', 'unknown')}\n"
-        output += f"- Requests: {metrics.get('total_requests', 0)} ({metrics.get('error_rate', 0)}% errors)\n"
-        output += f"- Active sessions: {metrics.get('active_sessions', 0)}\n"
-        output += f"- Avg response: {metrics.get('avg_response_ms', 0)}ms\n"
+            expected = config.get("expectedEmail", "")
+            email_hint = f" [{expected}]" if expected else ""
+            output += f"- **{conn_name}**: {config.get('tenant', 'unknown')}{email_hint}\n"
+            output += f"  {config.get('description', '')}\n"
 
         return [TextContent(type="text", text=output)]
 
@@ -213,7 +144,14 @@ def _call_tool_impl(name: str, arguments: dict):
     if not all([connection, module, command]):
         return [TextContent(type="text", text="Error: connection, module, and command are all required")]
 
-    # Execute command
+    # Validate connection exists in registry BEFORE touching session pool
+    registry = load_registry()
+    conn_config = registry.get("connections", {}).get(connection)
+    if not conn_config:
+        available = list(registry.get("connections", {}).keys())
+        return [TextContent(type="text", text=f"Error: Connection '{connection}' not found in registry.\nAvailable: {', '.join(available)}\n\nConnections must be pre-created in ~/.m365-connections.json")]
+
+    # Execute command via session pool
     result = call_pool("/run", "POST", {
         "connection": connection,
         "module": module,
@@ -225,9 +163,6 @@ def _call_tool_impl(name: str, arguments: dict):
 
     if status == "auth_required":
         device_code = result.get("device_code", "")
-        # Look up expected email for pre-login reminder
-        registry = load_registry()
-        conn_config = registry.get("connections", {}).get(connection, {})
         expected_email = conn_config.get("expectedEmail", "")
         if expected_email:
             sign_in_hint = f"\n>>> SIGN IN AS: {expected_email} <<<"
@@ -254,8 +189,6 @@ def _call_tool_impl(name: str, arguments: dict):
         # Check for email mismatch if session pool returned identity
         authenticated_as = result.get("authenticated_as")
         if authenticated_as:
-            registry = load_registry()
-            conn_config = registry.get("connections", {}).get(connection, {})
             expected_email = conn_config.get("expectedEmail", "")
             if expected_email and expected_email.lower() != authenticated_as.lower():
                 warning = f"WARNING: Wrong account! Expected {expected_email}, got {authenticated_as}\n\n"
@@ -264,73 +197,6 @@ def _call_tool_impl(name: str, arguments: dict):
         return [TextContent(type="text", text=output.strip() if output.strip() else "(no output)")]
 
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
-
-
-def _connection_add(args: dict):
-    name = args.get("name", "").strip()
-    tenant = args.get("tenant", "").strip()
-    app_id = args.get("appId", "").strip()
-    desc = args.get("description", "").strip()
-    mcps = args.get("mcps", [])
-
-    missing = [f for f in ["name", "tenant", "appId", "description", "mcps"] if not args.get(f)]
-    if missing:
-        return [TextContent(type="text", text=json.dumps({"error": f"Missing: {', '.join(missing)}"}, indent=2))]
-    if not is_valid_guid(app_id):
-        return [TextContent(type="text", text=json.dumps({"error": f"Invalid appId format: {app_id}"}, indent=2))]
-
-    registry = load_registry()
-    if name in registry.get("connections", {}):
-        return [TextContent(type="text", text=json.dumps({"error": f"'{name}' already exists. Use connection_update."}, indent=2))]
-
-    registry.setdefault("connections", {})[name] = {"appId": app_id, "tenant": tenant, "description": desc, "mcps": mcps}
-    if save_registry(registry):
-        return [TextContent(type="text", text=json.dumps({"success": True, "message": f"Connection '{name}' added"}, indent=2))]
-    return [TextContent(type="text", text=json.dumps({"error": "Failed to save"}, indent=2))]
-
-
-def _connection_remove(args: dict):
-    name = args.get("name", "").strip()
-    if not name:
-        return [TextContent(type="text", text=json.dumps({"error": "name is required"}, indent=2))]
-
-    registry = load_registry()
-    if name not in registry.get("connections", {}):
-        return [TextContent(type="text", text=json.dumps({"error": f"'{name}' not found", "available": list(registry.get("connections", {}).keys())}, indent=2))]
-
-    removed = registry["connections"].pop(name)
-    if save_registry(registry):
-        return [TextContent(type="text", text=json.dumps({"success": True, "message": f"'{name}' removed", "removed": removed}, indent=2))]
-    return [TextContent(type="text", text=json.dumps({"error": "Failed to save"}, indent=2))]
-
-
-def _connection_update(args: dict):
-    name = args.get("name", "").strip()
-    if not name:
-        return [TextContent(type="text", text=json.dumps({"error": "name is required"}, indent=2))]
-
-    registry = load_registry()
-    if name not in registry.get("connections", {}):
-        return [TextContent(type="text", text=json.dumps({"error": f"'{name}' not found"}, indent=2))]
-
-    conn = registry["connections"][name]
-    updated = []
-    for field in ["appId", "tenant", "description"]:
-        if args.get(field):
-            if field == "appId" and not is_valid_guid(args[field]):
-                return [TextContent(type="text", text=json.dumps({"error": f"Invalid appId: {args[field]}"}, indent=2))]
-            conn[field] = args[field].strip()
-            updated.append(field)
-    if args.get("mcps"):
-        conn["mcps"] = args["mcps"]
-        updated.append("mcps")
-
-    if not updated:
-        return [TextContent(type="text", text=json.dumps({"message": "No changes"}, indent=2))]
-
-    if save_registry(registry):
-        return [TextContent(type="text", text=json.dumps({"success": True, "updated": updated, "connection": conn}, indent=2))]
-    return [TextContent(type="text", text=json.dumps({"error": "Failed to save"}, indent=2))]
 
 
 async def main():

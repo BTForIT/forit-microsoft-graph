@@ -63,4 +63,4 @@ HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
 
 # Override base image entrypoint and run the session pool
 ENTRYPOINT []
-CMD ["gunicorn", "--bind", "0.0.0.0:5200", "--workers", "1", "--threads", "4", "session_pool:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5200", "--workers", "1", "--threads", "8", "--timeout", "600", "session_pool:app"]

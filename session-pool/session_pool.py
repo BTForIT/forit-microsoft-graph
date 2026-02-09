@@ -65,6 +65,7 @@ PORT = int(os.getenv("SESSION_POOL_PORT", "5200"))
 SINGLE_CONNECTION = os.getenv("M365_CONNECTION", "")
 LOG_LEVEL = os.getenv("SESSION_POOL_LOG_LEVEL", "INFO")
 COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "300"))
+LOCK_TIMEOUT = COMMAND_TIMEOUT + 30  # How long to wait for process_lock before giving up
 
 # Logging — dual output: stdout (docker logs) + persistent file (/app/logs/)
 LOG_DIR = os.getenv("SESSION_POOL_LOG_DIR", "/app/logs")
@@ -290,6 +291,28 @@ class Session:
                 else:
                     logger.info(f"[{self.session_id}] Azure context isolated (no expectedEmail to pin)")
 
+            # Verify cached auth before falling through to ready state.
+            # Docker volume tokens (e.g. ~/.Azure) survive container restarts,
+            # so sessions can restore without a device code even when not in
+            # the state file (e.g. container restarted during auth_pending).
+            module_config = MODULES.get(self.module)
+            if module_config and not module_config.get("use_pac"):
+                try:
+                    health_output = self._send_raw(module_config["health_cmd"], timeout=15)
+                    if re.search(module_config["health_pattern"], health_output):
+                        self.state = "authenticated"
+                        self.authenticated_as = self._extract_identity(health_output)
+                        logger.info(f"[{self.session_id}] Cached auth valid! Identity: {self.authenticated_as}")
+                        logger.info(f"[{self.session_id}] PowerShell started (PID: {self.process.pid})")
+                        if self.on_auth_complete:
+                            try:
+                                self.on_auth_complete()
+                            except Exception:
+                                pass
+                        return True
+                except Exception:
+                    pass  # No cached auth, proceed to ready state
+
             self.state = "ready"
             logger.info(f"[{self.session_id}] PowerShell started (PID: {self.process.pid})")
             return True
@@ -424,23 +447,7 @@ class Session:
                             self.state = "authenticated"
                             self.device_code = None
                             self.auth_initiated_by = None
-
-                            # Extract identity — strip ANSI codes for JSON parsing
-                            clean = re.sub(r'\x1b\[[\?0-9;]*[a-zA-Z]', '', health_output).strip()
-                            try:
-                                data = json.loads(clean)
-                                if self.module == "exo":
-                                    self.authenticated_as = data.get("UserPrincipalName") or data.get("Organization")
-                                elif self.module == "azure":
-                                    acct = data.get("Account", {})
-                                    self.authenticated_as = acct.get("Id") if isinstance(acct, dict) else str(acct)
-                                elif self.module == "teams":
-                                    self.authenticated_as = data.get("DisplayName")
-                                elif self.module == "pnp":
-                                    self.authenticated_as = data.get("Url")
-                            except (json.JSONDecodeError, AttributeError) as e:
-                                logger.warning(f"[{self.session_id}] Could not parse health JSON: {e}")
-
+                            self.authenticated_as = self._extract_identity(health_output)
                             logger.info(f"[{self.session_id}] Auth completed! Identity: {self.authenticated_as}")
 
                             # Notify pool to persist state
@@ -528,6 +535,24 @@ class Session:
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
+    def _extract_identity(self, health_output: str) -> Optional[str]:
+        """Extract authenticated identity from health check output."""
+        clean = re.sub(r'\x1b\[[\?0-9;]*[a-zA-Z]', '', health_output).strip()
+        try:
+            data = json.loads(clean)
+            if self.module == "azure":
+                acct = data.get("Account", {})
+                return acct.get("Id") if isinstance(acct, dict) else str(acct)
+            elif self.module == "exo":
+                return data.get("UserPrincipalName") or data.get("Organization")
+            elif self.module == "teams":
+                return data.get("DisplayName")
+            elif self.module == "pnp":
+                return data.get("Url")
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        return None
+
     def check_auth_complete(self) -> bool:
         """Check if the auth reader thread has transitioned state to authenticated.
 
@@ -558,6 +583,15 @@ class Session:
         """Execute a command."""
         module_config = MODULES.get(self.module)
         logger.info(f"[{self.session_id}] run_command called, state={self.state}, caller={caller_id}")
+
+        # Wait briefly if session is still starting up (start_process running outside pool lock)
+        if self.state == "initializing":
+            for _ in range(30):  # Wait up to 30 seconds
+                time.sleep(1)
+                if self.state != "initializing":
+                    break
+            if self.state == "initializing":
+                return {"status": "error", "error": "Session startup timed out. Retry in a moment."}
 
         # Check auth state
         if self.state == "auth_pending":
@@ -595,35 +629,62 @@ class Session:
 
         # Execute command
         logger.info(f"[{self.session_id}] Executing command (state=authenticated)")
-        with self.process_lock:
-            try:
-                if module_config.get("use_pac"):
-                    result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
-                    output = result.stdout + result.stderr
-                else:
-                    output = self._send_raw(command, timeout=timeout)
+        if not self.process_lock.acquire(timeout=LOCK_TIMEOUT):
+            logger.error(f"[{self.session_id}] Lock timeout after {LOCK_TIMEOUT}s — another command is stuck")
+            self.state = "error"
+            self.last_error = "Lock timeout — session stuck"
+            if self.process:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+            return {"status": "error", "error": "Session busy (another command hung). Session reset — retry will create a fresh session."}
+        try:
+            # Check process is alive before sending anything
+            if self.process and self.process.poll() is not None:
+                logger.error(f"[{self.session_id}] Process dead (exit code {self.process.returncode}), marking error")
+                self.state = "error"
+                self.last_error = f"Process exited with code {self.process.returncode}"
+                return {"status": "error", "error": "PowerShell process died. Session reset — retry will create a fresh session."}
 
-                self.last_command = datetime.now()
-                response = {"status": "success", "output": output}
-                if self.authenticated_as:
-                    response["authenticated_as"] = self.authenticated_as
+            if module_config.get("use_pac"):
+                result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+                output = result.stdout + result.stderr
+            else:
+                output = self._send_raw(command, timeout=timeout)
 
-                # Log output content — always preview, flag errors at WARNING
-                output_preview = output[:500].replace('\n', ' | ') if output else '(empty)'
-                error_patterns = re.search(r'(AADSTS\d+|error|exception|unauthorized|forbidden|access.denied)', output, re.IGNORECASE)
-                if error_patterns:
-                    logger.warning(f"[{self.session_id}] Command output contains error pattern [{error_patterns.group(0)}]: {output_preview}")
-                else:
-                    logger.info(f"[{self.session_id}] Command succeeded ({len(output)} chars): {output_preview}")
-                return response
+            self.last_command = datetime.now()
+            response = {"status": "success", "output": output}
+            if self.authenticated_as:
+                response["authenticated_as"] = self.authenticated_as
 
-            except TimeoutError as e:
-                logger.error(f"[{self.session_id}] Command timed out: {e}")
-                return {"status": "error", "error": f"Timeout: {e}"}
-            except Exception as e:
-                self.last_error = str(e)
-                logger.error(f"[{self.session_id}] Command failed: {e}")
-                return {"status": "error", "error": str(e)}
+            # Log output content — always preview, flag errors at WARNING
+            output_preview = output[:500].replace('\n', ' | ') if output else '(empty)'
+            error_patterns = re.search(r'(AADSTS\d+|error|exception|unauthorized|forbidden|access.denied)', output, re.IGNORECASE)
+            if error_patterns:
+                logger.warning(f"[{self.session_id}] Command output contains error pattern [{error_patterns.group(0)}]: {output_preview}")
+            else:
+                logger.info(f"[{self.session_id}] Command succeeded ({len(output)} chars): {output_preview}")
+            return response
+
+        except TimeoutError as e:
+            # Kill the hung process — subsequent commands to a stuck process
+            # will also hang, cascading into total thread starvation
+            logger.error(f"[{self.session_id}] Command timed out, killing process: {e}")
+            self.state = "error"
+            self.last_error = f"Timeout: {e}"
+            if self.process:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+            return {"status": "error", "error": f"Timeout: {e}. Session reset — retry will create a fresh session."}
+        except Exception as e:
+            self.last_error = str(e)
+            logger.error(f"[{self.session_id}] Command failed: {e}")
+            return {"status": "error", "error": str(e)}
+        finally:
+            self.process_lock.release()
 
     def stop(self):
         """Stop the session."""
@@ -642,7 +703,17 @@ class SessionPool:
     def __init__(self):
         self.sessions: Dict[str, Session] = {}
         self.lock = threading.Lock()
-        self._restore_sessions()
+        self.restoring = False
+        # Restore in background so Flask starts serving immediately
+        threading.Thread(target=self._restore_sessions_background, daemon=True).start()
+
+    def _restore_sessions_background(self):
+        """Run restore in background thread so HTTP server starts immediately."""
+        self.restoring = True
+        try:
+            self._restore_sessions()
+        finally:
+            self.restoring = False
 
     def save_state(self):
         """Persist session metadata to disk so we can restore after restart."""
@@ -716,7 +787,7 @@ class SessionPool:
                     health_output = session._send_raw(module_config["health_cmd"], timeout=30)
                     if re.search(module_config["health_pattern"], health_output):
                         session.state = "authenticated"
-                        session.authenticated_as = entry.get("authenticated_as")
+                        session.authenticated_as = session._extract_identity(health_output) or entry.get("authenticated_as")
                         session.on_auth_complete = self.save_state
                         self.sessions[session_id] = session
                         logger.info(f"[{session_id}] Restored! Identity: {session.authenticated_as}")
@@ -731,37 +802,64 @@ class SessionPool:
                 logger.warning(f"[{session_id}] Restore error: {e}")
 
     def get_or_create_session(self, connection_name: str, module: str) -> Session:
-        """Get or create a session."""
+        """Get or create a session.
+
+        IMPORTANT: start_process() runs OUTSIDE the pool lock to prevent
+        global thread starvation. PowerShell startup + health checks do I/O
+        that can hang — holding the pool lock during that would block ALL
+        connections, not just the one being created.
+        """
         session_id = f"{connection_name}/{module}"
+        new_session = None
 
         with self.lock:
-            if session_id not in self.sessions:
-                registry = load_connection_registry()
-                conn_config = registry.get("connections", {}).get(connection_name)
-                if not conn_config:
-                    raise ValueError(f"Connection '{connection_name}' not found")
+            # Evict dead sessions (killed after timeout or process crash)
+            existing = self.sessions.get(session_id)
+            if existing and existing.state == "error":
+                logger.info(f"[{session_id}] Evicting errored session, will recreate")
+                existing.stop()
+                del self.sessions[session_id]
 
-                # Check for module-specific app (e.g., EXO uses Microsoft's built-in app)
-                known_module_apps = registry.get("_knownModuleApps", {})
-                module_apps = conn_config.get("moduleApps", {})
+            if session_id in self.sessions:
+                return self.sessions[session_id]
 
-                # Priority: connection's moduleApps > registry's _knownModuleApps > connection's appId
-                app_id = module_apps.get(module) or known_module_apps.get(module) or conn_config.get("appId", "")
+            # Create session object and register it BEFORE starting the process.
+            # State is "initializing" so other threads won't try to use it yet.
+            registry = load_connection_registry()
+            conn_config = registry.get("connections", {}).get(connection_name)
+            if not conn_config:
+                raise ValueError(f"Connection '{connection_name}' not found")
 
-                logger.info(f"[{session_id}] Using app_id: {app_id}")
+            known_module_apps = registry.get("_knownModuleApps", {})
+            module_apps = conn_config.get("moduleApps", {})
+            app_id = module_apps.get(module) or known_module_apps.get(module) or conn_config.get("appId", "")
 
-                session = Session(
-                    tenant=conn_config.get("tenant", ""),
-                    module=module,
-                    connection_name=connection_name,
-                    app_id=app_id,
-                )
-                session.on_auth_complete = self.save_state
-                session.start_process()
-                self.sessions[session_id] = session
-                logger.info(f"Created session: {session_id}")
+            logger.info(f"[{session_id}] Using app_id: {app_id}")
 
-            return self.sessions[session_id]
+            new_session = Session(
+                tenant=conn_config.get("tenant", ""),
+                module=module,
+                connection_name=connection_name,
+                app_id=app_id,
+            )
+            new_session.on_auth_complete = self.save_state
+            self.sessions[session_id] = new_session
+            # Pool lock released here — start_process() runs outside
+
+        # Start process OUTSIDE pool lock — this does I/O (pwsh startup,
+        # Azure context isolation, cached auth health check) that can hang.
+        # Only blocks this session, not the entire pool.
+        try:
+            new_session.start_process()
+            logger.info(f"Created session: {session_id}")
+        except Exception as e:
+            logger.error(f"[{session_id}] start_process failed: {e}")
+            with self.lock:
+                if session_id in self.sessions and self.sessions[session_id] is new_session:
+                    del self.sessions[session_id]
+            raise
+
+        return new_session
 
     def run_command(self, connection_name: str, module: str, command: str, caller_id: str) -> Dict[str, Any]:
         """Run a command."""
@@ -794,7 +892,7 @@ class SessionPool:
     def get_status(self) -> Dict[str, Any]:
         """Get status of all sessions."""
         with self.lock:
-            return {
+            result = {
                 "sessions": [
                     {
                         "session_id": s.session_id,
@@ -805,6 +903,9 @@ class SessionPool:
                     for s in self.sessions.values()
                 ]
             }
+            if self.restoring:
+                result["restoring"] = True
+            return result
 
 
 # Global pool
@@ -863,9 +964,14 @@ class SessionKeepalive:
                 if not module_config or module_config.get("use_pac"):
                     continue
 
-                # Run health check to keep session alive
-                with session.process_lock:
+                # Non-blocking lock — skip sessions with a command in progress
+                if not session.process_lock.acquire(blocking=False):
+                    logger.debug(f"[{session.session_id}] Keepalive skipped — command in progress")
+                    continue
+                try:
                     health_output = session._send_raw(module_config["health_cmd"], timeout=30)
+                finally:
+                    session.process_lock.release()
 
                 if re.search(module_config["health_pattern"], health_output):
                     self.last_ping[session.session_id] = datetime.now()

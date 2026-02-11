@@ -3,7 +3,7 @@
   "description": "Persistent PowerShell sessions for M365/Azure. Supports EXO, PnP, Azure, Power Platform, Teams.",
   "transport": "stdio",
   "command": "python3",
-  "args": ["/Users/benjaminwesleythomas/GitProjects/forit-m365-mcp-suite/pwsh-manager/mcp_server.py"],
+  "args": ["/path/to/home/GitProjects/forit-microsoft-master/pwsh-manager/mcp_server.py"],
   "env": {
     "PWSH_MANAGER_URL": "http://localhost:5100"
   }

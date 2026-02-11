@@ -77,9 +77,9 @@ CONNECTIONS_FILE = Path.home() / ".m365-connections.json"
 MCP_NAME = "pwsh-manager"
 
 # SharePoint tenant prefixes (when different from domain prefix)
-# Maps tenant domain -> SharePoint tenant prefix (e.g., "foritllc" for foritllc.sharepoint.com)
+# Maps tenant domain -> SharePoint tenant prefix (e.g., "contoso" for contoso.sharepoint.com)
 SHAREPOINT_TENANTS = {
-    "forit.io": "foritllc",
+    "contoso.com": "contoso",
     # Add more mappings as needed
 }
 
@@ -168,7 +168,7 @@ def handle_list_tools() -> dict:
                     "properties": {
                         "connectionName": {
                             "type": "string",
-                            "description": "REQUIRED: Connection name from ~/.m365-connections.json (e.g., 'ForIT')",
+                            "description": "REQUIRED: Connection name from ~/.m365-connections.json (e.g., 'Contoso')",
                         },
                         "module": {
                             "type": "string",
@@ -193,7 +193,7 @@ def handle_list_tools() -> dict:
                     "properties": {
                         "connectionName": {
                             "type": "string",
-                            "description": "REQUIRED: Connection name (e.g., 'ForIT')",
+                            "description": "REQUIRED: Connection name (e.g., 'Contoso')",
                         },
                         "module": {
                             "type": "string",
@@ -212,7 +212,7 @@ def handle_list_tools() -> dict:
                     "properties": {
                         "connectionName": {
                             "type": "string",
-                            "description": "REQUIRED: Connection name (e.g., 'ForIT')",
+                            "description": "REQUIRED: Connection name (e.g., 'Contoso')",
                         },
                         "module": {
                             "type": "string",
@@ -251,7 +251,7 @@ def handle_list_tools() -> dict:
                     "properties": {
                         "connectionName": {
                             "type": "string",
-                            "description": "REQUIRED: Connection name (e.g., 'ForIT')",
+                            "description": "REQUIRED: Connection name (e.g., 'Contoso')",
                         },
                         "module": {
                             "type": "string",

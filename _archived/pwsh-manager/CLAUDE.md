@@ -2,7 +2,7 @@
 
 ## Connection Model
 
-Uses shared `~/.m365-connections.json` registry. Sessions are identified by `tenant:module` internally (e.g., `forit.io:exo`), but you always use **connectionName** (e.g., `ForIT`).
+Uses shared `~/.m365-connections.json` registry. Sessions are identified by `tenant:module` internally (e.g., `contoso.com:exo`), but you always use **connectionName** (e.g., `Contoso`).
 
 ### Critical Rules
 
@@ -15,7 +15,7 @@ Uses shared `~/.m365-connections.json` registry. Sessions are identified by `ten
 
 ```
 # Each call specifies connectionName explicitly
-pwsh_run connectionName=ForIT module=exo command="Get-Mailbox"
+pwsh_run connectionName=Contoso module=exo command="Get-Mailbox"
 pwsh_run connectionName=Personal module=azure command="Get-AzSubscription"
 
 # Both work independently - no switching needed
@@ -24,7 +24,7 @@ pwsh_run connectionName=Personal module=azure command="Get-AzSubscription"
 ### Wrong Patterns (Never Do This)
 
 - "Set active connection to X"
-- "Switch to the ForIT connection"
+- "Switch to the Contoso connection"
 - "Use the current session"
 - "The active session is..."
 - "The default connection is..."

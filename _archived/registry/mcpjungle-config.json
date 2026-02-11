@@ -2,6 +2,6 @@
   "name": "m365-registry",
   "description": "Central registry for M365 connections. Add, remove, update connections across all M365 MCPs.",
   "transport": "stdio",
-  "command": "/Users/benjaminwesleythomas/GitProjects/forit-m365-mcp-suite/registry/.venv/bin/python",
-  "args": ["/Users/benjaminwesleythomas/GitProjects/forit-m365-mcp-suite/registry/server.py"]
+  "command": "/path/to/home/GitProjects/forit-microsoft-master/registry/.venv/bin/python",
+  "args": ["/path/to/home/GitProjects/forit-microsoft-master/registry/server.py"]
 }

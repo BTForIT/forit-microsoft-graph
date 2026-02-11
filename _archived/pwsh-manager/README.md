@@ -57,7 +57,7 @@ mcpjungle add ./mcpjungle-config.json
 ### 3. Authenticate
 
 ```
-> pwsh_login tenant=forit.io module=exo
+> pwsh_login tenant=contoso.com module=exo
 
 **DEVICE CODE: ABC123XYZ**
 Go to: https://microsoft.com/devicelogin
@@ -66,7 +66,7 @@ Go to: https://microsoft.com/devicelogin
 ### 4. Run commands
 
 ```
-> pwsh_run tenant=forit.io module=exo command="Get-Mailbox -ResultSize 10"
+> pwsh_run tenant=contoso.com module=exo command="Get-Mailbox -ResultSize 10"
 ```
 
 ## API Reference
@@ -110,12 +110,12 @@ Edit `mcp_server.py` to add convenient aliases:
 
 ```python
 TENANT_ALIASES = {
-    "forit": "forit.io",
+    "contoso": "contoso.com",
     "personal": "yourdomain.com",
 }
 ```
 
-Then use: `pwsh_run tenant=forit command="Get-Mailbox"`
+Then use: `pwsh_run tenant=contoso command="Get-Mailbox"`
 
 ### SharePoint Tenant Mapping
 
@@ -124,12 +124,12 @@ If your SharePoint URL differs from your tenant domain prefix, add a mapping:
 ```python
 # Maps tenant domain -> SharePoint tenant prefix
 SHAREPOINT_TENANTS = {
-    "forit.io": "foritllc",  # Uses foritllc.sharepoint.com
+    "contoso.com": "contoso",  # Uses contoso.sharepoint.com
 }
 ```
 
-This is needed when your organization's SharePoint URL (e.g., `foritllc.sharepoint.com`)
-doesn't match the tenant domain prefix (e.g., `forit.io` → would default to `forit.sharepoint.com`).
+This is needed when your organization's SharePoint URL (e.g., `contoso.sharepoint.com`)
+doesn't match the tenant domain prefix (e.g., `contoso.com` → would default to `contoso.sharepoint.com`).
 
 ## Architecture
 
@@ -163,14 +163,14 @@ doesn't match the tenant domain prefix (e.g., `forit.io` → would default to `f
 Each `tenant:module` combination gets its own PowerShell process. You can have multiple tenants authenticated simultaneously:
 
 ```
-pwsh_login tenant=forit.io module=exo
 pwsh_login tenant=contoso.com module=exo
-pwsh_login tenant=forit.io module=pnp
+pwsh_login tenant=fabrikam.com module=exo
+pwsh_login tenant=contoso.com module=pnp
 
 pwsh_sessions
-# ✓ forit.io (exo) - Connected
 # ✓ contoso.com (exo) - Connected
-# ✓ forit.io (pnp) - Connected
+# ✓ fabrikam.com (exo) - Connected
+# ✓ contoso.com (pnp) - Connected
 ```
 
 ## Development
@@ -186,7 +186,7 @@ PWSH_MANAGER_DEBUG=true python session_manager.py
 
 # In another terminal, test
 curl http://localhost:5100/health
-curl -X POST http://localhost:5100/login -H "Content-Type: application/json" -d '{"tenant":"forit.io","module":"exo"}'
+curl -X POST http://localhost:5100/login -H "Content-Type: application/json" -d '{"tenant":"contoso.com","module":"exo"}'
 ```
 
 ### Build Docker image

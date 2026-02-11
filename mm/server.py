@@ -447,12 +447,12 @@ def _strip_email_signature(body, endpoint, conn_config=None):
     return body
 
 
-def _check_existing_threads(access_token, endpoint, method, body, base_url):
-    """Check for existing threads before sendMail. Returns (endpoint, method, body, note).
+def _intercept_sendmail(access_token, endpoint, method, body, base_url):
+    """Convert sendMail into a draft for user confirmation.
 
-    Does NOT auto-convert. Just searches for existing threads and returns
-    a note so the AI can confirm with the user whether to reply or send new.
-    The email is always sent as-is — the note is informational only.
+    Instead of sending immediately, creates a draft and returns it with
+    any existing thread info. The AI should show the draft to the user
+    and only send (POST /me/messages/{draftId}/send) after approval.
     """
     if method.upper() != "POST" or "sendMail" not in endpoint:
         return endpoint, method, body, None
@@ -464,35 +464,55 @@ def _check_existing_threads(access_token, endpoint, method, body, base_url):
     recipients = msg.get("toRecipients", [])
     if not recipients:
         return endpoint, method, body, None
-    email = recipients[0].get("emailAddress", {}).get("address", "")
-    if not email:
-        return endpoint, method, body, None
 
-    # Search for recent messages with this recipient
-    search_endpoint = (
-        f'/me/messages?$search="to:{email} OR from:{email}"'
-        f'&$top=5&$orderby=receivedDateTime desc'
-        f'&$select=id,subject,receivedDateTime'
+    # Create draft instead of sending — POST /me/messages (without /send)
+    draft_result = _make_graph_request(
+        access_token, "/me/messages", "POST", msg, base_url=base_url,
     )
-    search = _make_graph_request(access_token, search_endpoint, base_url=base_url)
 
-    if search["status"] != "success" or not search["data"].get("value"):
-        return endpoint, method, body, None  # no history or search failed, send as-is
+    if draft_result["status"] != "success":
+        return endpoint, method, body, None  # draft failed, fall through to original
 
-    # Build a summary of existing threads for the AI to present
-    threads = search["data"]["value"]
-    thread_list = "\n".join(
-        f'  - "{t.get("subject", "(no subject)")}" ({t.get("receivedDateTime", "")[:10]})'
-        for t in threads
-    )
+    draft = draft_result["data"]
+    draft_id = draft.get("id", "")
+    to_email = recipients[0].get("emailAddress", {}).get("address", "")
+    subject = msg.get("subject", "(no subject)")
+
+    # Search for existing threads with this recipient
+    thread_info = ""
+    if to_email:
+        search_endpoint = (
+            f'/me/messages?$search="to:{to_email} OR from:{to_email}"'
+            f'&$top=5&$orderby=receivedDateTime desc'
+            f'&$select=id,subject,receivedDateTime'
+        )
+        search = _make_graph_request(access_token, search_endpoint, base_url=base_url)
+        if search["status"] == "success" and search["data"].get("value"):
+            threads = search["data"]["value"]
+            thread_list = "\n".join(
+                f'  - "{t.get("subject", "(no subject)")}" ({t.get("receivedDateTime", "")[:10]}) [id: {t.get("id", "")[:20]}...]'
+                for t in threads
+            )
+            thread_info = (
+                f"\n\nExisting threads with {to_email}:\n{thread_list}\n"
+                f"If this should be a REPLY to one of these, delete this draft "
+                f"(DELETE /me/messages/{draft_id}) and use "
+                f"POST /me/messages/{{messageId}}/reply instead."
+            )
+
     note = (
-        f"WARNING: Sending new email to {email}, but existing threads found:\n"
-        f"{thread_list}\n"
-        f"If this should be a reply to one of these threads, cancel and use "
-        f"POST /me/messages/{{messageId}}/reply instead."
+        f"DRAFT CREATED — not sent yet.\n"
+        f"To: {to_email}\n"
+        f"Subject: {subject}\n"
+        f"Draft ID: {draft_id}\n"
+        f"\nTo send: POST /me/messages/{draft_id}/send"
+        f"\nTo discard: DELETE /me/messages/{draft_id}"
+        f"{thread_info}\n"
+        f"\nConfirm with user before sending."
     )
 
-    return endpoint, method, body, note
+    # Return a no-op — the draft is already created, just return the note
+    return None, None, None, note
 
 
 # === Session Pool (PowerShell) ===
@@ -775,11 +795,16 @@ def _handle_graph_request(arguments: dict) -> list:
     body = arguments.get("body")
     base_url = res_config["base_url"]
 
-    # Email interceptors: auto-thread detection + signature stripping
+    # Email interceptors: draft creation + signature stripping
     note = None
-    endpoint, method, body, note = _check_existing_threads(
+    endpoint, method, body, note = _intercept_sendmail(
         access_token, endpoint, method, body, base_url,
     )
+
+    # If interceptor created a draft, return the note (no further API call needed)
+    if endpoint is None:
+        return [TextContent(type="text", text=note)]
+
     if body:
         body = _strip_email_signature(body, endpoint, conn_config)
 

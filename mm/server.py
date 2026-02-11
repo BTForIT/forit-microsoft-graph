@@ -492,6 +492,68 @@ def _run_graph_hooks(endpoint, method, body, conn_config):
     return body, notes
 
 
+# === PowerShell Run Hooks ===
+# Each hook: (match_fn, handler_fn)
+#   match_fn(command, module) -> bool
+#   handler_fn(command, module, conn_config) -> (command, note)
+#     - command: modified command (or original if unchanged)
+#     - note: string to prepend to response, or None
+# Hooks run in order. All matching hooks fire (notes accumulate, command chains).
+
+# Az modules installed in the container (Dockerfile)
+_INSTALLED_AZ_MODULES = {"Az.Accounts"}
+
+# Common cmdlet prefixes from Az modules NOT installed — redirect to Invoke-AzRestMethod
+_MISSING_AZ_CMDLETS = re.compile(
+    r'\b(Get|Set|New|Remove|Update)-(Az(?:ApplicationInsights|Monitor|OperationalInsights|LogAnalytics'
+    r'|Network|Compute|Storage|WebApp|FunctionApp|Sql|CosmosDB|ServiceBus|EventHub|ApiManagement'
+    r'|Aks|ContainerRegistry|KeyVault|Resource|Subscription|Cdn|FrontDoor|Dns|TrafficManager'
+    r'|RedisCache|SignalR|AppConfiguration|CognitiveServices|MachineLearning|DataFactory)\w*)\b',
+    re.IGNORECASE,
+)
+
+
+def _hook_missing_az_module(command, module, conn_config):
+    """Block cmdlets from uninstalled Az modules — redirect to Invoke-AzRestMethod."""
+    if module != "azure":
+        return command, None
+    match = _MISSING_AZ_CMDLETS.search(command)
+    if not match:
+        return command, None
+    cmdlet = match.group(0)
+    # Return None command to signal "don't execute, just return the note"
+    return None, (
+        f"'{cmdlet}' requires an Az module that isn't installed in the container. "
+        f"Only Az.Accounts is installed. Use Invoke-AzRestMethod to call the Azure REST API directly. "
+        f"Example: Invoke-AzRestMethod -Path '/subscriptions/{{subId}}/resourceGroups/{{rg}}/providers/Microsoft.Insights/components?api-version=2020-02-02' -Method GET"
+    )
+
+
+RUN_HOOKS = [
+    (
+        lambda cmd, mod: mod == "azure" and bool(_MISSING_AZ_CMDLETS.search(cmd)),
+        _hook_missing_az_module,
+    ),
+]
+
+
+def _run_run_hooks(command, module, conn_config):
+    """Run all matching PowerShell run hooks. Returns (command, [notes]).
+
+    If any hook sets command to None, execution should be skipped —
+    just return the accumulated notes.
+    """
+    notes = []
+    for match_fn, handler_fn in RUN_HOOKS:
+        if match_fn(command, module):
+            command, note = handler_fn(command, module, conn_config)
+            if note:
+                notes.append(note)
+            if command is None:
+                break  # Hook says don't execute
+    return command, notes
+
+
 # === Session Pool (PowerShell) ===
 
 def call_pool(endpoint: str, method: str = "GET", data: dict = None) -> dict:
@@ -658,6 +720,12 @@ def _handle_run(arguments: dict) -> list:
     if err:
         return [TextContent(type="text", text=err)]
 
+    # Run hooks (missing module redirects, etc.)
+    command, run_notes = _run_run_hooks(command, module, conn_config)
+    if command is None:
+        # Hook blocked execution — return the notes as the response
+        return [TextContent(type="text", text="\n\n".join(run_notes))]
+
     # Execute command via session pool
     result = call_pool("/run", "POST", {
         "connection": connection,
@@ -716,7 +784,11 @@ def _handle_run(arguments: dict) -> list:
                 )
                 output = "WARNING: Authenticated with wrong account. Re-authentication required.\n\n" + output
 
-        return [TextContent(type="text", text=output.strip() if output.strip() else "(no output)")]
+        output = output.strip() if output.strip() else "(no output)"
+        if run_notes:
+            prefix = "\n".join(f"**Note:** {n}" for n in run_notes)
+            output = f"{prefix}\n\n{output}"
+        return [TextContent(type="text", text=output)]
 
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 

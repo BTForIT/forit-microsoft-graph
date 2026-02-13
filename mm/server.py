@@ -529,10 +529,31 @@ def _hook_missing_az_module(command, module, conn_config):
     )
 
 
+def _hook_teams_error_action_stop(command, module, conn_config):
+    """Wrap Teams commands with ErrorAction Stop to prevent hanging on API errors.
+
+    MicrosoftTeams 7.6.0 Set-CsCallQueue (and similar) throws non-terminating
+    errors when the API fails, then continues into internal retry loops that hang
+    forever (~300s until our timeout kills the process, cascading into broken pipes
+    and forced re-auth). Wrapping with Stop makes the error terminate immediately,
+    so the PowerShell marker still gets written and the session stays alive.
+    """
+    return (
+        f'$ErrorActionPreference = "Stop"; try {{ {command} }} '
+        f'catch {{ Write-Error "$_" -ErrorAction Continue }} '
+        f'finally {{ $ErrorActionPreference = "Continue" }}',
+        None,
+    )
+
+
 RUN_HOOKS = [
     (
         lambda cmd, mod: mod == "azure" and bool(_MISSING_AZ_CMDLETS.search(cmd)),
         _hook_missing_az_module,
+    ),
+    (
+        lambda cmd, mod: mod == "teams",
+        _hook_teams_error_action_stop,
     ),
 ]
 

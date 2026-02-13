@@ -102,7 +102,7 @@ STATE_FILE = os.path.join(STATE_DIR, f"sessions-{SINGLE_CONNECTION or 'unified'}
 MODULES = {
     "exo": {
         "name": "Exchange Online",
-        "connect_cmd": "Connect-ExchangeOnline -Device -ShowBanner:$false",
+        "connect_cmd": "Connect-ExchangeOnline -Device -ShowBanner:$false -SkipLoadingCmdletHelp",
         "health_cmd": "Get-ConnectionInformation | Select-Object -First 1 | ConvertTo-Json",
         "health_pattern": r"(Organization|TenantId)",
         "device_code_pattern": r"code\s+([A-Z0-9]{8,})",
@@ -634,8 +634,7 @@ class Session:
         if blocked:
             return {"status": "error", "error": blocked}
 
-        # Execute command
-        logger.info(f"[{self.session_id}] Executing command (state=authenticated)")
+        # Execute command — acquire lock (blocks if another command is in progress)
         if not self.process_lock.acquire(timeout=LOCK_TIMEOUT):
             logger.error(f"[{self.session_id}] Lock timeout after {LOCK_TIMEOUT}s — another command is stuck")
             self.state = "error"
@@ -647,6 +646,7 @@ class Session:
                     pass
             return {"status": "error", "error": "Session busy (another command hung). Session reset — retry will create a fresh session."}
         try:
+            logger.info(f"[{self.session_id}] Executing command (lock acquired)")
             # Check process is alive before sending anything
             if self.process and self.process.poll() is not None:
                 logger.error(f"[{self.session_id}] Process dead (exit code {self.process.returncode}), marking error")
@@ -673,11 +673,13 @@ class Session:
             else:
                 logger.info(f"[{self.session_id}] Command succeeded ({len(output)} chars): {output_preview}")
 
-            # Fire-and-forget GC to reduce memory pressure between commands
+            # GC to reduce memory pressure between commands — use _send_raw
+            # so stdout stays in sync (fire-and-forget without marker causes desync).
+            # Timeout must be generous: if GC times out, the MARKER stays in stdout
+            # and the next command reads it as its own output → corrupt results.
             try:
                 if self.process and self.process.poll() is None and not module_config.get("use_pac"):
-                    self.process.stdin.write("[System.GC]::Collect()\n")
-                    self.process.stdin.flush()
+                    self._send_raw("[System.GC]::Collect()", timeout=30)
             except Exception:
                 pass  # Non-critical — don't fail the response over GC
 
@@ -779,9 +781,9 @@ class SessionPool:
             module = entry["module"]
             session_id = f"{conn_name}/{module}"
 
-            # Skip if module not configured
+            # Skip if module not configured or doesn't cache tokens
             module_config = MODULES.get(module)
-            if not module_config or module_config.get("use_pac"):
+            if not module_config or module_config.get("use_pac") or module_config.get("no_cached_auth"):
                 logger.info(f"[{session_id}] Skipping restore — module not supported for restore")
                 continue
 
@@ -978,7 +980,7 @@ class SessionKeepalive:
 
             try:
                 module_config = MODULES.get(session.module)
-                if not module_config or module_config.get("use_pac"):
+                if not module_config or module_config.get("use_pac") or module_config.get("no_cached_auth"):
                     continue
 
                 # Non-blocking lock — skip sessions with a command in progress

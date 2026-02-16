@@ -2,22 +2,168 @@
 
 Unified Microsoft 365 MCP server for AI assistants. One server, two tools, all of M365.
 
-## History
+## Prerequisites
 
-This repo originally contained four separate MCP servers:
+| Requirement | Why |
+|-------------|-----|
+| **Python 3.10+** | MCP server runtime (`mm/server.py`) |
+| **Docker** | Session pool runs PowerShell modules in containers |
+| **An Azure AD (Entra ID) app registration** | Both tools authenticate via device code flow against your app |
+| **MCPJungle** (or any MCP host) | Hosts the `mm` MCP server for your AI assistant |
 
-| Server | Purpose | Status |
-|--------|---------|--------|
-| **graph** | Microsoft Graph REST API (TypeScript) | Archived |
-| **pnp** | CLI for Microsoft 365 / SharePoint (TypeScript) | Archived |
-| **pwsh-manager** | PowerShell session management (Python/Docker) | Archived |
-| **registry** | Connection registry management (Python) | Archived |
+## Quick Start
 
-In February 2026, these were consolidated into a single **mm** server with two tools:
-- `mm__run` — PowerShell commands via a Docker session pool
-- `mm__graph_request` — Direct Microsoft Graph REST API calls via MSAL
+### 1. Create an Azure AD app registration
 
-The old servers are preserved in `_archived/` for reference.
+Every tenant you want to manage needs an app registration. This is how MM authenticates — there are no shared/default apps.
+
+**Option A: Azure Portal (recommended for first-time setup)**
+
+1. Go to [Azure Portal > App Registrations > New registration](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/CreateApplicationBlade/quickStartType~/null/isMSAApp~/false)
+2. Name it something like `MM-CLI` (or whatever you want)
+3. Set **Supported account types** to "Accounts in this organizational directory only"
+4. Leave **Redirect URI** blank (device code flow doesn't need one)
+5. Click **Register**
+6. Copy the **Application (client) ID** — this is your `appId`
+7. Copy the **Directory (tenant) ID** — this is your `tenantId`
+8. Go to **API permissions > Add a permission > Microsoft Graph > Delegated permissions** and add:
+
+| Permission | For |
+|------------|-----|
+| `Mail.ReadWrite` | Email (read, send, manage) |
+| `Calendars.ReadWrite` | Calendar operations |
+| `Files.ReadWrite.All` | OneDrive / SharePoint files |
+| `Sites.ReadWrite.All` | SharePoint sites |
+| `User.Read` | Basic profile |
+| `User.ReadBasic.All` | Look up other users |
+| `Contacts.ReadWrite` | Contacts |
+| `Tasks.ReadWrite` | To Do / Planner tasks |
+| `Notes.ReadWrite.All` | OneNote |
+| `Chat.ReadWrite` | Teams chat |
+| `Team.ReadBasic.All` | Teams team info |
+| `Channel.ReadBasic.All` | Teams channels |
+| `ChannelMessage.Send` | Send Teams messages |
+
+9. Click **Grant admin consent** (requires admin role)
+
+> **No client secret needed.** MM uses device code flow (public client), not client credentials.
+
+**Option B: CLI for Microsoft 365**
+
+```bash
+npm install -g @pnp/cli-microsoft365
+m365 setup   # Creates the app registration interactively
+```
+
+See [docs/M365-CLI-SETUP.md](docs/M365-CLI-SETUP.md) for details.
+
+### 2. Configure the connection registry
+
+The connection registry tells MM which tenants exist and how to reach them.
+
+```bash
+# Create your first connection interactively
+./mm-connections add Contoso-GA
+```
+
+This creates/updates `~/.m365-connections.json`. You can also create it manually:
+
+```json
+{
+  "connections": {
+    "Contoso-GA": {
+      "appId": "your-app-client-id",
+      "tenant": "contoso.com",
+      "tenantId": "your-tenant-guid",
+      "expectedEmail": "admin@contoso.com",
+      "description": "Contoso Global Admin",
+      "mcps": ["mm"]
+    }
+  }
+}
+```
+
+**Connection fields:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `appId` | Yes | Application (client) ID from your app registration |
+| `tenant` | Yes | Domain (`contoso.com`) or `tenantId` |
+| `tenantId` | Yes | Directory (tenant) ID GUID |
+| `expectedEmail` | Recommended | Expected sign-in email — MM warns if you auth as the wrong account |
+| `description` | Yes | Human-readable label |
+| `mcps` | Yes | Which MCP servers can use this connection (`["mm"]`) |
+| `skipSignatureStrip` | No | Set `true` to skip email signature stripping (default: false) |
+
+**Connection naming convention:**
+- **GA** — Global Admin (tenant admin operations)
+- **Individual** — Your user account on a work tenant
+- **Personal** — Your own personal tenant
+
+**Managing connections:**
+```bash
+./mm-connections list                          # List all connections
+./mm-connections add Contoso-GA                # Add interactively
+./mm-connections edit Contoso-GA appId abc-123  # Set a field
+./mm-connections duplicate Contoso-GA Contoso-Individual  # Copy
+./mm-connections remove Old-Connection         # Delete
+```
+
+### 3. Install Python dependencies
+
+```bash
+cd mm
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 4. Start the session pool
+
+The session pool runs PowerShell modules (Exchange, SharePoint, Azure, Teams) in Docker containers.
+
+```bash
+cd session-pool
+docker compose -p m365-session-pool -f docker-compose.unified.yml up -d
+```
+
+Verify it's running:
+```bash
+curl http://localhost:5200/health | jq
+```
+
+### 5. Register with your MCP host
+
+```bash
+cp mm/mcpjungle-config.example.json mm/mcpjungle-config.json
+# Edit mm/mcpjungle-config.json — update paths to match your system
+mcpjungle register --conf mm/mcpjungle-config.json
+```
+
+The example config expects a venv at `mm/.venv/bin/python`. Update the `command` and `args` paths to match your setup.
+
+### 6. Use it
+
+```bash
+# List connections
+mcpjungle invoke mm run '{}'
+
+# PowerShell (Exchange)
+mcpjungle invoke mm run '{"connection":"Contoso-GA","module":"exo","command":"Get-Mailbox -ResultSize 1"}'
+
+# Graph API
+mcpjungle invoke mm graph_request '{"connection":"Contoso-GA","endpoint":"/me"}'
+
+# Power Automate (Flow API)
+mcpjungle invoke mm graph_request '{"connection":"Contoso-GA","endpoint":"/providers/Microsoft.ProcessSimple/environments","resource":"flow"}'
+```
+
+**Auth is automatic.** If a connection isn't authenticated, the tool returns a device code:
+```
+DEVICE CODE: XXXXXXXX
+Go to: https://microsoft.com/devicelogin
+```
+Complete the sign-in, then retry the command. No pre-auth step needed.
 
 ## Architecture
 
@@ -51,77 +197,6 @@ The old servers are preserved in `_archived/` for reference.
           └───────────────────────┘
 ```
 
-## Quick Start
-
-### 1. Configure connections
-
-Create `~/.m365-connections.json` with your tenant connections:
-
-```json
-{
-  "connections": {
-    "Contoso-GA": {
-      "appId": "your-azure-ad-app-id",
-      "tenant": "contoso.com",
-      "tenantId": "your-tenant-guid",
-      "expectedEmail": "admin@contoso.com",
-      "description": "Contoso Global Admin",
-      "mcps": ["mm"]
-    }
-  }
-}
-```
-
-Manage connections with the `mm-connections` CLI:
-```bash
-./mm-connections list                          # List all connections
-./mm-connections add Contoso-GA                # Add interactively
-./mm-connections edit Contoso-GA appId abc-123  # Set a field
-./mm-connections duplicate Contoso-GA Contoso-Individual  # Copy
-```
-
-Connection naming convention:
-- **GA** — Global Admin (tenant admin operations)
-- **Individual** — Your user account on a work tenant
-- **Personal** — Your own personal tenant
-
-### 2. Start the session pool
-
-```bash
-# Unified mode — single container, all connections (recommended for dev/small servers)
-cd session-pool
-docker compose -p m365-session-pool -f docker-compose.unified.yml up -d
-
-# Isolated mode — one container per connection (recommended for production/32GB+ RAM)
-docker compose -p m365-session-pool -f docker-compose.isolated.yml up -d
-```
-
-### 3. Register with your MCP host
-
-Copy `mm/mcpjungle-config.example.json` to `mm/mcpjungle-config.json`, update the paths for your system, then register:
-
-```bash
-mcpjungle register --conf mm/mcpjungle-config.json
-```
-
-### 4. Use it
-
-```bash
-# List connections
-mcpjungle invoke mm run '{}'
-
-# PowerShell (Exchange)
-mcpjungle invoke mm run '{"connection":"<YOUR_CONNECTION>","module":"exo","command":"Get-Mailbox -ResultSize 1"}'
-
-# Graph API
-mcpjungle invoke mm graph_request '{"connection":"<YOUR_CONNECTION>","endpoint":"/me"}'
-
-# Power Automate (Flow API)
-mcpjungle invoke mm graph_request '{"connection":"<YOUR_CONNECTION>","endpoint":"/providers/Microsoft.ProcessSimple/environments","resource":"flow"}'
-```
-
-Auth is automatic — if a connection isn't authenticated, the tool returns a device code. No pre-auth step needed.
-
 ## Tools
 
 ### `mm__run` — PowerShell via Session Pool
@@ -133,6 +208,7 @@ Execute PowerShell commands through persistent Docker-hosted sessions.
 | `connection` | Connection name from registry |
 | `module` | `exo` (Exchange), `pnp` (SharePoint), `azure`, `teams` |
 | `command` | PowerShell command to execute |
+| `confirmed` | Set `true` to bypass send guards (see [Send Guards](#send-guards)) |
 
 Omit all parameters to list available connections.
 
@@ -147,6 +223,19 @@ Direct HTTP requests to Microsoft Graph (or Flow API) via MSAL tokens.
 | `method` | `GET`, `POST`, `PATCH`, `PUT`, `DELETE` (default: GET) |
 | `body` | Request body for POST/PATCH/PUT |
 | `resource` | `graph` (default) or `flow` for Power Automate |
+| `confirmed` | Set `true` to bypass send guards (see [Send Guards](#send-guards)) |
+
+### Send Guards
+
+Email and Teams message sends are **blocked by default**. When an AI assistant tries to send an email or Teams message, MM intercepts the request and returns a formatted draft preview instead. The assistant must re-call with `confirmed: true` to actually send.
+
+**Guarded Graph endpoints:**
+- `POST .../sendMail`, `.../reply`, `.../replyAll`, `.../forward`, `.../send`
+- `POST /teams/{id}/channels/{id}/messages`, `/chats/{id}/messages`
+
+**Guarded PowerShell commands:**
+- `Send-MailMessage`, `Send-MgUserMail`
+- `New-MgChatMessage`, `New-MgTeamChannelMessage`, `Submit-PnPTeamsChannelMessage`
 
 ## Session Pool
 
@@ -207,9 +296,9 @@ curl http://localhost:5200/status | jq
 curl http://localhost:5200/metrics | jq
 ```
 
-## App Registration
+## History
 
-Each tenant needs an Azure AD app registration with the appropriate API permissions. See [docs/M365-CLI-SETUP.md](docs/M365-CLI-SETUP.md) for instructions.
+This repo originally contained four separate MCP servers (graph, pnp, pwsh-manager, registry), consolidated in February 2026 into the single `mm` server. The old servers are preserved in `_archived/` for reference.
 
 ## License
 

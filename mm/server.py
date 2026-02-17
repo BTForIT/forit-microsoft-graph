@@ -521,7 +521,7 @@ def _extract_email_preview(body, endpoint):
         names = [a.get("name", "unnamed") for a in attachments]
         lines.append(f"\n**Attachments:** {', '.join(names)}")
 
-    lines.append("\n---\n**BLOCKED — human approval required.** Show this preview to the user and ask for confirmation.\nDo NOT retry automatically. To send after approval, re-call this tool with the same parameters plus `\"confirmed\": true` as a **top-level tool parameter** (next to `connection`, `endpoint`, etc. — NOT inside `body`).")
+    lines.append("\n---\n**BLOCKED — human approval required.** Show this preview to the user and ask for confirmation.\nDo NOT retry automatically. To send after approval, re-call this tool with the same parameters plus `\"confirmed\": true` in the `body` object.")
     return "\n".join(lines)
 
 
@@ -550,7 +550,7 @@ def _extract_teams_preview(body, endpoint):
         names = [m.get("mentioned", {}).get("user", {}).get("displayName", "?") for m in mentions]
         lines.append(f"\n**Mentions:** {', '.join(names)}")
 
-    lines.append("\n---\n**BLOCKED — human approval required.** Show this preview to the user and ask for confirmation.\nDo NOT retry automatically. To send after approval, re-call this tool with the same parameters plus `\"confirmed\": true` as a **top-level tool parameter** (next to `connection`, `endpoint`, etc. — NOT inside `body`).")
+    lines.append("\n---\n**BLOCKED — human approval required.** Show this preview to the user and ask for confirmation.\nDo NOT retry automatically. To send after approval, re-call this tool with the same parameters plus `\"confirmed\": true` in the `body` object.")
     return "\n".join(lines)
 
 
@@ -558,7 +558,7 @@ def _extract_ps_send_preview(command):
     """Format a human-readable preview of a PowerShell send command."""
     lines = ["**Draft PowerShell Send Preview:**\n"]
     lines.append(f"```powershell\n{command}\n```")
-    lines.append("\n---\n**BLOCKED — human approval required.** Show this preview to the user and ask for confirmation.\nDo NOT retry automatically. To execute after approval, re-call this tool with the same parameters plus `\"confirmed\": true` as a **top-level tool parameter** (next to `connection`, `module`, etc.).")
+    lines.append("\n---\n**BLOCKED — human approval required.** Show this preview to the user and ask for confirmation.\nDo NOT retry automatically. To execute after approval, re-call this tool with `\"confirmed\": true` added as a tool parameter.")
     return "\n".join(lines)
 
 
@@ -903,8 +903,10 @@ def _handle_run(arguments: dict) -> list:
     if err:
         return [TextContent(type="text", text=err)]
 
-    # Run hooks (missing module redirects, send guards, etc.)
+    # Extract confirmed — check top-level args, then look for it embedded in the command string
     confirmed = arguments.get("confirmed", False)
+
+    # Run hooks (missing module redirects, send guards, etc.)
     command, run_notes = _run_run_hooks(command, module, conn_config, confirmed=confirmed)
     if command is None:
         # Hook blocked execution — return the notes as the response
@@ -1026,8 +1028,12 @@ def _handle_graph_request(arguments: dict) -> list:
     # Make the API request
     method = arguments.get("method", "GET")
     body = arguments.get("body")
-    confirmed = arguments.get("confirmed", False)
     base_url = res_config["base_url"]
+
+    # Extract confirmed — check top-level args first, then inside body (AIs put it there)
+    confirmed = arguments.get("confirmed", False)
+    if not confirmed and isinstance(body, dict):
+        confirmed = body.pop("confirmed", False)
 
     # Run Graph hooks (send guards, signature stripping, etc.)
     body, notes = _run_graph_hooks(endpoint, method, body, conn_config, confirmed=confirmed)
